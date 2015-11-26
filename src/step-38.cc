@@ -48,13 +48,38 @@
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
 
+#include <deal.II/meshworker/dof_info.h>
+#include <deal.II/meshworker/integration_info.h>
+#include <deal.II/meshworker/simple.h>
+#include <deal.II/meshworker/loop.h>
+
 #include <fstream>
 #include <iostream>
 
+const double a_rk[] = {0.0, 3.0/4.0, 1.0/3.0};
+const double b_rk[] = {1.0, 1.0/4.0, 2.0/3.0};
 
 namespace Step38
 {
    using namespace dealii;
+
+   //------------------------------------------------------------------------------
+   // Class for integrating rhs using MeshWorker
+   //------------------------------------------------------------------------------
+   template <int spacedim>
+   class RHSIntegrator
+   {
+   private:
+      static const unsigned int dim = spacedim-1;
+
+   public:
+      RHSIntegrator (const DoFHandler<dim,spacedim> &dof_handler)
+         : dof_info (dof_handler) {};
+
+      MeshWorker::IntegrationInfoBox<dim,spacedim> info_box;
+      MeshWorker::DoFInfo<dim,spacedim> dof_info;
+      MeshWorker::Assembler::ResidualSimple< Vector<double> > assembler;
+   };
 
    // @sect3{The <code>VTEProblem</code> class template}
 
@@ -110,6 +135,7 @@ namespace Step38
       void assemble_streamfun_matrix ();
       void assemble_streamfun_rhs ();
       void solve ();
+      void setup_mesh_worker (RHSIntegrator<spacedim> &);
       void output_results () const;
       void compute_error () const;
 
@@ -122,7 +148,7 @@ namespace Step38
       FE_DGQArbitraryNodes<dim,spacedim> fe_vort;
       DoFHandler<dim,spacedim>      dof_handler_vort;
 
-      MappingQ<dim, spacedim>       mapping;
+      MappingQ<dim,spacedim>        mapping;
 
       SparsityPattern               sparsity_pattern;
       SparseMatrix<double>          system_matrix;
@@ -138,6 +164,14 @@ namespace Step38
       Vector<double>                vorticity_rhs;
 
       std::vector< Vector<double> > inv_mass_matrix;
+
+      typedef MeshWorker::DoFInfo<dim,spacedim> DoFInfo;
+      typedef MeshWorker::IntegrationInfo<dim,spacedim> CellInfo;
+
+      static void integrate_cell_term (DoFInfo &dinfo, CellInfo &info);
+      static void integrate_boundary_term (DoFInfo &dinfo, CellInfo &info);
+      static void integrate_face_term (DoFInfo &dinfo1, DoFInfo &dinfo2,
+                                       CellInfo &info1, CellInfo &info2);
    };
 
 
@@ -378,11 +412,11 @@ namespace Step38
 
       Vector<double>   cell_matrix (dofs_per_cell);
 
-      // Cell iterator
-      typename DoFHandler<dim,spacedim>::active_cell_iterator
-      cell = dof_handler_vort.begin_active(),
-      endc = dof_handler_vort.end();
-      for (unsigned int c = 0; cell!=endc; ++cell, ++c)
+      unsigned int c = 0;
+      for (typename DoFHandler<dim,spacedim>::active_cell_iterator
+           cell = dof_handler_vort.begin_active(),
+           endc = dof_handler_vort.end();
+           cell!=endc; ++cell, ++c)
       {
          fe_values.reinit (cell);
          cell_matrix = 0.0;
@@ -522,7 +556,46 @@ namespace Step38
                 preconditioner);
    }
 
+   //------------------------------------------------------------------------------
+   // Create mesh worker for integration
+   //------------------------------------------------------------------------------
+   template <int spacedim>
+   void VTEProblem<spacedim>::setup_mesh_worker (RHSIntegrator<spacedim> &rhs_integrator)
+   {
+      std::cout << "Setting up mesh worker ...\n";
 
+      MeshWorker::IntegrationInfoBox<dim,spacedim> &info_box = rhs_integrator.info_box;
+      MeshWorker::DoFInfo<dim,spacedim> &dof_info = rhs_integrator.dof_info;
+      MeshWorker::Assembler::ResidualSimple< Vector<double> > &
+      assembler = rhs_integrator.assembler;
+
+      const unsigned int n_gauss_points = fe_vort.degree+1;
+      info_box.initialize_gauss_quadrature(n_gauss_points,
+                                           n_gauss_points,
+                                           n_gauss_points);
+
+      // Add solution vector to info_box
+//      AnyData solution_data;
+//      solution_data.add< Vector<double>* > (&vorticity, "vorticity");
+//      info_box.cell_selector.add     ("vorticity", true, false, false);
+//      info_box.boundary_selector.add ("vorticity", true, false, false);
+//      info_box.face_selector.add     ("vorticity", true, false, false);
+
+      info_box.initialize_update_flags ();
+      info_box.add_update_flags_all      (update_quadrature_points);
+      info_box.add_update_flags_cell     (update_gradients);
+      info_box.add_update_flags_boundary (update_values);
+      info_box.add_update_flags_face     (update_values);
+
+      Vector<double> dummy;
+      //info_box.initialize (fe_vort, mapping, solution_data, dummy);
+      info_box.initialize (fe_vort, mapping);
+
+      // Attach rhs vector to assembler
+      AnyData rhs;
+      rhs.add< Vector<double>* > (&vorticity_rhs, "vorticity_rhs");
+      assembler.initialize (rhs);
+   }
 
    // @sect4{VTEProblem::output_result}
 
@@ -605,6 +678,9 @@ namespace Step38
       make_grid_and_dofs();
       assemble_mass_matrix ();
       assemble_streamfun_matrix ();
+
+      RHSIntegrator<spacedim> rhs_integrator (dof_handler_vort);
+      setup_mesh_worker (rhs_integrator);
 
       double t  = 0;
       double Tf = 1.0;
