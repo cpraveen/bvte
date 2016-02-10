@@ -48,38 +48,15 @@
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
 
-#include <deal.II/meshworker/dof_info.h>
-#include <deal.II/meshworker/integration_info.h>
-#include <deal.II/meshworker/simple.h>
-#include <deal.II/meshworker/loop.h>
-
 #include <fstream>
 #include <iostream>
 
 const double a_rk[] = {0.0, 3.0/4.0, 1.0/3.0};
 const double b_rk[] = {1.0, 1.0/4.0, 2.0/3.0};
 
-namespace Step38
+namespace VTE
 {
    using namespace dealii;
-
-   //------------------------------------------------------------------------------
-   // Class for integrating rhs using MeshWorker
-   //------------------------------------------------------------------------------
-   template <int spacedim>
-   class RHSIntegrator
-   {
-   private:
-      static const unsigned int dim = spacedim-1;
-
-   public:
-      RHSIntegrator (const DoFHandler<dim,spacedim> &dof_handler)
-         : dof_info (dof_handler) {};
-
-      MeshWorker::IntegrationInfoBox<dim,spacedim> info_box;
-      MeshWorker::DoFInfo<dim,spacedim> dof_info;
-      MeshWorker::Assembler::ResidualSimple< Vector<double> > assembler;
-   };
 
    // @sect3{The <code>VTEProblem</code> class template}
 
@@ -128,18 +105,22 @@ namespace Step38
       void run ();
 
    private:
-      static const unsigned int dim = spacedim-1;
+      static const int dim = spacedim-1;
 
       void make_grid_and_dofs ();
       void assemble_mass_matrix();
       void assemble_streamfun_matrix ();
       void assemble_streamfun_rhs ();
-      void solve ();
-      void setup_mesh_worker (RHSIntegrator<spacedim> &);
+      void assemble_vte_rhs ();
+      void update_vte (unsigned int rk);
+      void solve_streamfun ();
       void output_results () const;
       void compute_error () const;
 
 
+      double       dt;
+      unsigned int n_rk_stages;
+      
       Triangulation<dim,spacedim>   triangulation;
 
       FE_Q<dim,spacedim>            fe_stream;
@@ -164,14 +145,6 @@ namespace Step38
       Vector<double>                vorticity_rhs;
 
       std::vector< Vector<double> > inv_mass_matrix;
-
-      typedef MeshWorker::DoFInfo<dim,spacedim> DoFInfo;
-      typedef MeshWorker::IntegrationInfo<dim,spacedim> CellInfo;
-
-      static void integrate_cell_term (DoFInfo &dinfo, CellInfo &info);
-      static void integrate_boundary_term (DoFInfo &dinfo, CellInfo &info);
-      static void integrate_face_term (DoFInfo &dinfo1, DoFInfo &dinfo2,
-                                       CellInfo &info1, CellInfo &info2);
    };
 
 
@@ -288,10 +261,12 @@ namespace Step38
       :
       fe_stream (QGaussLobatto<1>(degree+1)),
       dof_handler_stream (triangulation),
-      fe_vort (QGaussLobatto<1>(degree+1)),
+      fe_vort (QGauss<1>(degree+1)),
       dof_handler_vort (triangulation),
       mapping (degree)
-   {}
+   {
+      n_rk_stages = 3;
+   }
 
 
    // @sect4{VTEProblem::make_grid_and_dofs}
@@ -391,6 +366,13 @@ namespace Step38
       inv_mass_matrix.resize(triangulation.n_cells());
       for (unsigned int c=0; c<triangulation.n_cells(); ++c)
          inv_mass_matrix[c].reinit(fe_vort.dofs_per_cell);
+      
+      // set cell number
+      unsigned int index=0;
+      for (typename Triangulation<dim,spacedim>::active_cell_iterator
+           cell=triangulation.begin_active();
+           cell!=triangulation.end(); ++cell, ++index)
+         cell->set_user_index (index);
    }
 
    //------------------------------------------------------------------------------
@@ -493,7 +475,9 @@ namespace Step38
       preconditioner.initialize(system_matrix, 1.2);
    }
 
+   //------------------------------------------------------------------------------
    // Assemble rhs of streamfunction problem
+   //------------------------------------------------------------------------------
    template <int spacedim>
    void VTEProblem<spacedim>::assemble_streamfun_rhs ()
    {
@@ -539,15 +523,14 @@ namespace Step38
 
    }
 
-   // @sect4{VTEProblem::solve}
-
-   // The next function is the one that solves the linear system. Here, too, no
-   // changes are necessary:
+   //------------------------------------------------------------------------------
+   // Solve for the stream function
+   //------------------------------------------------------------------------------
    template <int spacedim>
-   void VTEProblem<spacedim>::solve ()
+   void VTEProblem<spacedim>::solve_streamfun ()
    {
       SolverControl solver_control (streamfun.size(),
-                                    1e-7 * system_rhs.l2_norm());
+                                    1e-8 * system_rhs.l2_norm());
       SolverCG<>    cg (solver_control);
 
       cg.solve (system_matrix,
@@ -556,47 +539,153 @@ namespace Step38
                 preconditioner);
    }
 
+
    //------------------------------------------------------------------------------
-   // Create mesh worker for integration
+   // Assemble right hand side of VTE
    //------------------------------------------------------------------------------
    template <int spacedim>
-   void VTEProblem<spacedim>::setup_mesh_worker (RHSIntegrator<spacedim> &rhs_integrator)
+   void VTEProblem<spacedim>::assemble_vte_rhs ()
    {
-      std::cout << "Setting up mesh worker ...\n";
+      vorticity_rhs = 0;
+      
+      const QGauss<dim>  quadrature_formula(fe_vort.degree + 1);
+      FEValues<dim,spacedim> fe_values_vort (mapping, fe_vort, quadrature_formula,
+                                             update_values            |
+                                             update_gradients         |
+                                             update_quadrature_points |
+                                             update_JxW_values);
+      const unsigned int dofs_per_cell = fe_vort.dofs_per_cell;
+      const unsigned int n_q_points    = quadrature_formula.size();
+      
+      Vector<double>            cell_rhs (dofs_per_cell);
+      Vector<double>            cell_rhs_nbr (dofs_per_cell);
 
-      MeshWorker::IntegrationInfoBox<dim,spacedim> &info_box = rhs_integrator.info_box;
-      MeshWorker::DoFInfo<dim,spacedim> &dof_info = rhs_integrator.dof_info;
-      MeshWorker::Assembler::ResidualSimple< Vector<double> > &
-      assembler = rhs_integrator.assembler;
+      std::vector<types::global_dof_index> local_dof_indices (dofs_per_cell);
+      std::vector<types::global_dof_index> local_dof_indices_nbr (dofs_per_cell);
 
-      const unsigned int n_gauss_points = fe_vort.degree+1;
-      info_box.initialize_gauss_quadrature(n_gauss_points,
-                                           n_gauss_points,
-                                           n_gauss_points);
+      std::vector<double> vorticity_values (n_q_points);
+      
+      FEValues<dim,spacedim> fe_values_stream (mapping, fe_stream, quadrature_formula,
+                                               update_gradients);
+      std::vector< Tensor<1,spacedim> > stream_gradient_values (n_q_points, Tensor<1,spacedim>());
+      
+      // Face related
+      const QGauss<dim-1> quadrature_face (fe_vort.degree + 1);
+      FEFaceValues<dim,spacedim> fe_face_values_vort (fe_vort, quadrature_face,
+                                                      update_values |
+                                                      update_quadrature_points |
+                                                      update_normal_vectors);
+      FEFaceValues<dim,spacedim> fe_face_values_vort_nbr (fe_vort, quadrature_face,
+                                                          update_values);
+      FEFaceValues<dim,spacedim> fe_face_values_stream (fe_stream, quadrature_face,
+                                                        update_gradients);
+      FEFaceValues<dim,spacedim> fe_face_values_stream_nbr (fe_stream, quadrature_face,
+                                                            update_gradients);
+      
+      const unsigned int n_face_q_points    = quadrature_face.size();
+      std::vector< Tensor<1,spacedim> > stream_gradient_values_nbr (n_face_q_points, Tensor<1,spacedim>());
+      std::vector<double> vorticity_values_nbr (n_face_q_points);
 
-      // Add solution vector to info_box
-//      AnyData solution_data;
-//      solution_data.add< Vector<double>* > (&vorticity, "vorticity");
-//      info_box.cell_selector.add     ("vorticity", true, false, false);
-//      info_box.boundary_selector.add ("vorticity", true, false, false);
-//      info_box.face_selector.add     ("vorticity", true, false, false);
+      for (typename DoFHandler<dim,spacedim>::active_cell_iterator
+           cell = dof_handler_vort.begin_active(),
+           endc = dof_handler_vort.end();
+           cell!=endc; ++cell)
+      {
+         const unsigned int cell_no = cell->user_index();
 
-      info_box.initialize_update_flags ();
-      info_box.add_update_flags_all      (update_quadrature_points);
-      info_box.add_update_flags_cell     (update_gradients);
-      info_box.add_update_flags_boundary (update_values);
-      info_box.add_update_flags_face     (update_values);
+         cell_rhs = 0;
+         
+         fe_values_vort.reinit (cell);
+         fe_values_vort.get_function_values (vorticity, vorticity_values);
+         
+         typename DoFHandler<dim,spacedim>::active_cell_iterator
+         cell_stream (&triangulation,
+                      cell->level(),
+                      cell->index(),
+                      &dof_handler_stream);
+         fe_values_stream.reinit (cell_stream);
+         fe_values_stream.get_function_gradients (streamfun, stream_gradient_values);
+         
+         for (unsigned int q_point=0; q_point<n_q_points; ++q_point)
+         {
+            const Point<spacedim> &radial_unit_vector = fe_values_vort.quadrature_point (q_point);
+            Tensor<1,spacedim> vel;
+            cross_product (vel, radial_unit_vector, stream_gradient_values[q_point]);
+            for (unsigned int i=0; i<dofs_per_cell; ++i)
+               cell_rhs(i) -= vorticity_values[q_point] *
+                              vel * fe_values_vort.shape_grad (i, q_point) *
+                              fe_values_vort.JxW(q_point);
+         }
+         
+         for (unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
+            if(cell->neighbor(f)->has_children() == false)
+            {
+               const unsigned int cell_nbr_no = cell->neighbor(f)->user_index();
+               
+               cell_rhs_nbr = 0;
+               
+               if(cell->neighbor(f)->level() == cell->level() &&
+                  cell_no < cell_nbr_no)
+               {
+                  fe_face_values_vort.reinit (cell, f);
+                  fe_face_values_vort_nbr.reinit(cell->neighbor(f),
+                                                 cell->neighbor_of_neighbor(f));
+                  
+                  fe_face_values_vort.get_function_values (vorticity, vorticity_values);
+                  fe_face_values_vort_nbr.get_function_values (vorticity, vorticity_values_nbr);
+                  
+                  fe_face_values_stream.reinit (cell_stream, f);
+                  fe_face_values_stream_nbr.reinit(cell_stream->neighbor(f),
+                                                   cell_stream->neighbor_of_neighbor(f));
+                  
+                  fe_face_values_stream.get_function_gradients (streamfun, stream_gradient_values);
+                  fe_face_values_stream_nbr.get_function_gradients (streamfun, stream_gradient_values_nbr);
+                  
+                  for (unsigned int q_point=0; q_point<n_face_q_points; ++q_point)
+                  {
+                     const Point<spacedim> &radial_unit_vector = fe_face_values_vort.quadrature_point (q_point);
+                     Tensor<1,spacedim> vel, vel_nbr;
+                     cross_product (vel, radial_unit_vector, stream_gradient_values[q_point]);
+                     cross_product (vel_nbr, radial_unit_vector, stream_gradient_values_nbr[q_point]);
+                     double veln = 0.5 * (vel + vel_nbr) * fe_face_values_vort.normal_vector (q_point);
+                     double flux = (veln > 0) ? veln * vorticity_values[q_point] : veln * vorticity_values_nbr[q_point];
 
-      Vector<double> dummy;
-      //info_box.initialize (fe_vort, mapping, solution_data, dummy);
-      info_box.initialize (fe_vort, mapping);
-
-      // Attach rhs vector to assembler
-      AnyData rhs;
-      rhs.add< Vector<double>* > (&vorticity_rhs, "vorticity_rhs");
-      assembler.initialize (rhs);
+                     for (unsigned int i=0; i<dofs_per_cell; ++i)
+                     {
+                        cell_rhs(i) += flux *
+                                       fe_face_values_vort.shape_value (i, q_point) *
+                                       fe_face_values_vort.JxW(q_point);
+                        cell_rhs_nbr(i) -= flux *
+                                           fe_face_values_vort_nbr.shape_value (i, q_point) *
+                                           fe_face_values_vort.JxW(q_point);
+                     }
+                     
+                     cell->neighbor(f)->get_dof_indices (local_dof_indices_nbr);
+                     for (unsigned int i=0; i<dofs_per_cell; ++i)
+                        vorticity_rhs(local_dof_indices_nbr[i]) += cell_rhs_nbr (i) * inv_mass_matrix[cell_nbr_no](i);
+                  }
+               }
+               else if(cell->neighbor_is_coarser(f))
+               {
+                  AssertThrow (false, ExcNotImplemented());
+               }
+            }
+         
+         cell->get_dof_indices (local_dof_indices);
+         for (unsigned int i=0; i<dofs_per_cell; ++i)
+            vorticity_rhs(local_dof_indices[i]) += cell_rhs(i) * inv_mass_matrix[cell_no](i);
+      }
    }
 
+   // Perform rk'th stage of SSPRK scheme
+   template <int spacedim>
+   void VTEProblem<spacedim>::update_vte (unsigned int rk)
+   {
+      for(unsigned int i=0; i<dof_handler_vort.n_dofs(); ++i)
+         vorticity(i) = a_rk[rk] * vorticity_old(i) +
+                        b_rk[rk] * (vorticity(i) - dt * vorticity_rhs(i));
+   }
+   
    // @sect4{VTEProblem::output_result}
 
    // This is the function that generates graphical output from the
@@ -679,18 +768,26 @@ namespace Step38
       assemble_mass_matrix ();
       assemble_streamfun_matrix ();
 
-      RHSIntegrator<spacedim> rhs_integrator (dof_handler_vort);
-      setup_mesh_worker (rhs_integrator);
-
+      unsigned int iter = 0;
       double t  = 0;
       double Tf = 1.0;
       while (t < Tf)
       {
-         assemble_streamfun_rhs ();
-         solve ();
-         output_results ();
-         compute_error ();
-         return;
+         // compute time step
+         dt = 0;
+         
+         for(unsigned int rk=0; rk<n_rk_stages; ++rk)
+         {
+            assemble_streamfun_rhs ();
+            solve_streamfun ();
+            assemble_vte_rhs ();
+            update_vte (rk);
+            output_results ();
+            compute_error ();
+            return;
+         }
+         
+         t += dt; ++iter;
       }
    }
 }
@@ -706,11 +803,11 @@ int main ()
    try
    {
       using namespace dealii;
-      using namespace Step38;
+      using namespace VTE;
 
       deallog.depth_console (0);
 
-      VTEProblem<3> vte;
+      VTEProblem<3> vte (2);
       vte.run();
    }
    catch (std::exception &exc)
