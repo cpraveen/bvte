@@ -57,6 +57,26 @@ const double b_rk[] = {1.0, 1.0/4.0, 2.0/3.0};
 namespace VTE
 {
    using namespace dealii;
+   
+   template <int dim>
+   class InitialCondition  : public Function<dim>
+   {
+   public:
+      InitialCondition () : Function<dim>() {}
+      
+      virtual double value (const Point<dim>   &p,
+                            const unsigned int  component = 0) const;
+   };
+   
+   
+   template <>
+   double
+   InitialCondition<3>::value (const Point<3> &p,
+                               const unsigned int) const
+   {
+      return (std::sin(numbers::PI * p(0)) *
+              std::cos(numbers::PI * p(1))*exp(p(2)));
+   }
 
    // @sect3{The <code>VTEProblem</code> class template}
 
@@ -108,6 +128,7 @@ namespace VTE
       static const int dim = spacedim-1;
 
       void make_grid_and_dofs ();
+      void initialize_vorticity ();
       void assemble_mass_matrix();
       void assemble_streamfun_matrix ();
       void assemble_streamfun_rhs ();
@@ -376,6 +397,18 @@ namespace VTE
    }
 
    //------------------------------------------------------------------------------
+   // Set initial condition for vorticity
+   //------------------------------------------------------------------------------
+   template <int spacedim>
+   void VTEProblem<spacedim>::initialize_vorticity ()
+   {
+      VectorTools::interpolate (mapping,
+                                dof_handler_vort,
+                                InitialCondition<spacedim>(),
+                                vorticity);
+   }
+   
+   //------------------------------------------------------------------------------
    // Assemble mass matrix for each cell
    // Invert it and store
    //------------------------------------------------------------------------------
@@ -488,16 +521,18 @@ namespace VTE
                                         update_values              |
                                         update_quadrature_points   |
                                         update_JxW_values);
+      FEValues<dim,spacedim> fe_values_vort (mapping,
+                                             fe_vort,
+                                             quadrature_formula,
+                                             update_values);
 
       const unsigned int        dofs_per_cell = fe_stream.dofs_per_cell;
       const unsigned int        n_q_points    = quadrature_formula.size();
 
       Vector<double>            cell_rhs (dofs_per_cell);
 
-      std::vector<double>       rhs_values(n_q_points);
+      std::vector<double>       vorticity_values(n_q_points);
       std::vector<types::global_dof_index> local_dof_indices (dofs_per_cell);
-
-      const RightHandSide<spacedim> rhs;
 
       for (typename DoFHandler<dim,spacedim>::active_cell_iterator
            cell = dof_handler_stream.begin_active(),
@@ -505,15 +540,20 @@ namespace VTE
            cell!=endc; ++cell)
       {
          cell_rhs = 0;
-
          fe_values.reinit (cell);
 
-         rhs.value_list (fe_values.get_quadrature_points(), rhs_values);
+         typename DoFHandler<dim,spacedim>::active_cell_iterator
+         cell_vort (&triangulation,
+                    cell->level(),
+                    cell->index(),
+                    &dof_handler_vort);
+         fe_values_vort.reinit (cell_vort);
+         fe_values_vort.get_function_values (vorticity, vorticity_values);
 
          for (unsigned int i=0; i<dofs_per_cell; ++i)
             for (unsigned int q_point=0; q_point<n_q_points; ++q_point)
                cell_rhs(i) += fe_values.shape_value(i,q_point) *
-                              rhs_values[q_point]*
+                              vorticity_values[q_point]*
                               fe_values.JxW(q_point);
 
          cell->get_dof_indices (local_dof_indices);
@@ -583,8 +623,10 @@ namespace VTE
                                                             update_gradients);
       
       const unsigned int n_face_q_points    = quadrature_face.size();
-      std::vector< Tensor<1,spacedim> > stream_gradient_values_nbr (n_face_q_points, Tensor<1,spacedim>());
-      std::vector<double> vorticity_values_nbr (n_face_q_points);
+      std::vector< Tensor<1,spacedim> > stream_gradient_values_face     (n_face_q_points, Tensor<1,spacedim>());
+      std::vector< Tensor<1,spacedim> > stream_gradient_values_face_nbr (n_face_q_points, Tensor<1,spacedim>());
+      std::vector<double> vorticity_values_face     (n_face_q_points);
+      std::vector<double> vorticity_values_face_nbr (n_face_q_points);
 
       for (typename DoFHandler<dim,spacedim>::active_cell_iterator
            cell = dof_handler_vort.begin_active(),
@@ -630,25 +672,25 @@ namespace VTE
                   fe_face_values_vort.reinit (cell, f);
                   fe_face_values_vort_nbr.reinit(cell->neighbor(f),
                                                  cell->neighbor_of_neighbor(f));
-                  
-                  fe_face_values_vort.get_function_values (vorticity, vorticity_values);
-                  fe_face_values_vort_nbr.get_function_values (vorticity, vorticity_values_nbr);
+
+                  fe_face_values_vort.get_function_values (vorticity, vorticity_values_face);
+                  fe_face_values_vort_nbr.get_function_values (vorticity, vorticity_values_face_nbr);
                   
                   fe_face_values_stream.reinit (cell_stream, f);
                   fe_face_values_stream_nbr.reinit(cell_stream->neighbor(f),
                                                    cell_stream->neighbor_of_neighbor(f));
                   
-                  fe_face_values_stream.get_function_gradients (streamfun, stream_gradient_values);
-                  fe_face_values_stream_nbr.get_function_gradients (streamfun, stream_gradient_values_nbr);
+                  fe_face_values_stream.get_function_gradients (streamfun, stream_gradient_values_face);
+                  fe_face_values_stream_nbr.get_function_gradients (streamfun, stream_gradient_values_face_nbr);
                   
                   for (unsigned int q_point=0; q_point<n_face_q_points; ++q_point)
                   {
                      const Point<spacedim> &radial_unit_vector = fe_face_values_vort.quadrature_point (q_point);
                      Tensor<1,spacedim> vel, vel_nbr;
-                     cross_product (vel, radial_unit_vector, stream_gradient_values[q_point]);
-                     cross_product (vel_nbr, radial_unit_vector, stream_gradient_values_nbr[q_point]);
+                     cross_product (vel, radial_unit_vector, stream_gradient_values_face[q_point]);
+                     cross_product (vel_nbr, radial_unit_vector, stream_gradient_values_face_nbr[q_point]);
                      double veln = 0.5 * (vel + vel_nbr) * fe_face_values_vort.normal_vector (q_point);
-                     double flux = (veln > 0) ? veln * vorticity_values[q_point] : veln * vorticity_values_nbr[q_point];
+                     double flux = (veln > 0) ? veln * vorticity_values_face[q_point] : veln * vorticity_values_face_nbr[q_point];
 
                      for (unsigned int i=0; i<dofs_per_cell; ++i)
                      {
@@ -767,6 +809,7 @@ namespace VTE
       make_grid_and_dofs();
       assemble_mass_matrix ();
       assemble_streamfun_matrix ();
+      initialize_vorticity ();
 
       unsigned int iter = 0;
       double t  = 0;
@@ -788,6 +831,7 @@ namespace VTE
          }
          
          t += dt; ++iter;
+         std::cout << "Iter = " << iter << ",  t = " << t << ",  dt = ", dt << std::endl;
       }
    }
 }
