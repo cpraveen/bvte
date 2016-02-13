@@ -157,7 +157,7 @@ namespace VTE
       void assemble_vte_rhs ();
       void update_vte (unsigned int rk);
       void solve_streamfun ();
-      void output_results () const;
+      void output_results (const double elapsed_time) const;
       void compute_error () const;
 
 
@@ -261,7 +261,7 @@ namespace VTE
       mapping (degree)
    {
       n_rk_stages = 3;
-      cfl = 0.1;
+      cfl = 0.5;
       solver_type = DIRECT;
       
       cfl = cfl/(2.0*degree+1);
@@ -406,11 +406,10 @@ namespace VTE
 
       Vector<double>   cell_matrix (dofs_per_cell);
 
-      unsigned int c = 0;
       for (typename DoFHandler<dim,spacedim>::active_cell_iterator
            cell = dof_handler_vort.begin_active(),
            endc = dof_handler_vort.end();
-           cell!=endc; ++cell, ++c)
+           cell!=endc; ++cell)
       {
          fe_values.reinit (cell);
          cell_matrix = 0.0;
@@ -422,6 +421,7 @@ namespace VTE
                                  fe_values.JxW (q_point);
 
          // Invert cell_matrix
+         unsigned int c = cell->user_index();
          for (unsigned int i=0; i<dofs_per_cell; ++i)
             inv_mass_matrix[c](i) = 1.0/cell_matrix(i);
       }
@@ -553,6 +553,7 @@ namespace VTE
       switch (solver_type)
       {
          case DIRECT:
+         {
             static SparseDirectUMFPACK  solver;
             if(first_time)
             {
@@ -561,8 +562,10 @@ namespace VTE
             }
             solver.vmult (streamfun, system_rhs);
             break;
+         }
             
          case CG:
+         {
             SolverControl solver_control (streamfun.size(),
                                           1e-8 * system_rhs.l2_norm());
             SolverCG<>    cg (solver_control);
@@ -575,6 +578,10 @@ namespace VTE
                       system_rhs,
                       preconditioner);
             break;
+         }
+            
+         default:
+            AssertThrow(false, ExcMessage("Unknown solver type !!!"));
       }
    }
 
@@ -615,7 +622,8 @@ namespace VTE
                                                       quadrature_face,
                                                       update_values |
                                                       update_quadrature_points |
-                                                      update_normal_vectors);
+                                                      update_normal_vectors |
+                                                      update_JxW_values);
       FEFaceValues<dim,spacedim> fe_face_values_vort_nbr (mapping,
                                                           fe_vort,
                                                           quadrature_face,
@@ -716,11 +724,12 @@ namespace VTE
                                            fe_face_values_vort_nbr.shape_value (i, q_point) *
                                            fe_face_values_vort.JxW(q_point);
                      }
-                     
-                     cell->neighbor(f)->get_dof_indices (local_dof_indices_nbr);
-                     for (unsigned int i=0; i<dofs_per_cell; ++i)
-                        vorticity_rhs(local_dof_indices_nbr[i]) += cell_rhs_nbr (i) * inv_mass_matrix[cell_nbr_no](i);
                   }
+                  
+                  // Add local contribute to rhs vector
+                  cell->neighbor(f)->get_dof_indices (local_dof_indices_nbr);
+                  for (unsigned int i=0; i<dofs_per_cell; ++i)
+                     vorticity_rhs(local_dof_indices_nbr[i]) += cell_rhs_nbr (i) * inv_mass_matrix[cell_nbr_no](i);
                }
                else if(cell->neighbor_is_coarser(f))
                {
@@ -728,6 +737,7 @@ namespace VTE
                }
             }
          
+         // Add local contribute to rhs vector
          cell->get_dof_indices (local_dof_indices);
          for (unsigned int i=0; i<dofs_per_cell; ++i)
             vorticity_rhs(local_dof_indices[i]) += cell_rhs(i) * inv_mass_matrix[cell_no](i);
@@ -743,7 +753,6 @@ namespace VTE
    template <int spacedim>
    void VTEProblem<spacedim>::update_vte (unsigned int rk)
    {
-      std::cout << "RK stage = " << rk << std::endl;
       for(unsigned int i=0; i<dof_handler_vort.n_dofs(); ++i)
          vorticity(i) = a_rk[rk] * vorticity_old(i) +
                         b_rk[rk] * (vorticity(i) - dt * vorticity_rhs(i));
@@ -776,7 +785,7 @@ namespace VTE
    //   each element in each coordinate direction as many times as the
    //   polynomial degree of the finite element in use.
    template <int spacedim>
-   void VTEProblem<spacedim>::output_results () const
+   void VTEProblem<spacedim>::output_results (const double elapsed_time) const
    {
       static unsigned int count = 0;
       
@@ -794,6 +803,8 @@ namespace VTE
 
       std::string filename = "sol-" + Utilities::int_to_string(count, 4) + ".vtk";
       std::ofstream output (filename.c_str());
+      DataOutBase::VtkFlags flags(elapsed_time, count);
+      data_out.set_flags(flags);
       data_out.write_vtk (output);
       ++count;
    }
@@ -836,7 +847,7 @@ namespace VTE
       assemble_mass_matrix ();
       assemble_streamfun_matrix ();
       initialize_vorticity ();
-      output_results ();
+      output_results (0);
       
       unsigned int iter = 0;
       double t  = 0;
@@ -860,7 +871,7 @@ namespace VTE
                    << ",  t = " << t
                    << ",  dt = " << dt << std::endl;
          
-         if(iter%10 == 0) output_results ();
+         if(iter%10 == 0) output_results (t);
       }
    }
 }
