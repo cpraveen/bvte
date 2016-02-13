@@ -37,6 +37,7 @@
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/solver_control.h>
 #include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/sparse_direct.h>
 #include <deal.II/lac/precondition.h>
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
@@ -57,25 +58,46 @@ const double b_rk[] = {1.0, 1.0/4.0, 2.0/3.0};
 namespace VTE
 {
    using namespace dealii;
+   enum SolverType { DIRECT, CG };
    
+   // Initial vorticity distribution
+   // x = R*cos(lambda), y = R*sin(lambda), z = R*sin(theta)
+   // -pi/2 <= theta <= pi/2,   -pi <= lambda <= pi
    template <int dim>
    class InitialCondition  : public Function<dim>
    {
    public:
-      InitialCondition () : Function<dim>() {}
+      InitialCondition ();
       
       virtual double value (const Point<dim>   &p,
                             const unsigned int  component = 0) const;
+      
+   private:
+      unsigned int n;
+      double a, omg, K;
    };
    
-   
+   template <int dim>
+   InitialCondition<dim>::InitialCondition ()
+   :
+   Function<dim>()
+   {
+      n = 4;
+      a = n*n + 3*n + 2;
+      omg = 7.8480e-6;
+      K = 7.8480e-6;
+   }
+
    template <>
    double
    InitialCondition<3>::value (const Point<3> &p,
                                const unsigned int) const
    {
-      return (std::sin(numbers::PI * p(0)) *
-              std::cos(numbers::PI * p(1))*exp(p(2)));
+      const double R = p.norm();
+      const double lambda = atan2 (p[1], p[0]);
+      const double theta = asin (p[2]/R);
+      return 2.0 * omg * sin(theta)
+             - K * a * sin(theta) * std::pow(cos(theta),n) * cos(n*lambda);
    }
 
    // @sect3{The <code>VTEProblem</code> class template}
@@ -139,8 +161,9 @@ namespace VTE
       void compute_error () const;
 
 
-      double       dt;
+      double       cfl, dt;
       unsigned int n_rk_stages;
+      SolverType   solver_type;
       
       Triangulation<dim,spacedim>   triangulation;
 
@@ -222,55 +245,6 @@ namespace VTE
       return return_value;
    }
 
-
-
-   template <int dim>
-   class RightHandSide : public Function<dim>
-   {
-   public:
-      RightHandSide () : Function<dim>() {}
-
-      virtual double value (const Point<dim>   &p,
-                            const unsigned int  component = 0) const;
-   };
-
-
-   template <>
-   double
-   RightHandSide<3>::value (const Point<3> &p,
-                            const unsigned int /*component*/) const
-   {
-      using numbers::PI;
-
-      Tensor<2,3> hessian;
-
-      hessian[0][0] = -PI*PI*sin(PI*p(0))*cos(PI*p(1))*exp(p(2));
-      hessian[1][1] = -PI*PI*sin(PI*p(0))*cos(PI*p(1))*exp(p(2));
-      hessian[2][2] = sin(PI*p(0))*cos(PI*p(1))*exp(p(2));
-
-      hessian[0][1] = -PI*PI*cos(PI*p(0))*sin(PI*p(1))*exp(p(2));
-      hessian[1][0] = -PI*PI*cos(PI*p(0))*sin(PI*p(1))*exp(p(2));
-
-      hessian[0][2] = PI*cos(PI*p(0))*cos(PI*p(1))*exp(p(2));
-      hessian[2][0] = PI*cos(PI*p(0))*cos(PI*p(1))*exp(p(2));
-
-      hessian[1][2] = -PI*sin(PI*p(0))*sin(PI*p(1))*exp(p(2));
-      hessian[2][1] = -PI*sin(PI*p(0))*sin(PI*p(1))*exp(p(2));
-
-      Tensor<1,3> gradient;
-      gradient[0] = PI * cos(PI*p(0))*cos(PI*p(1))*exp(p(2));
-      gradient[1] = - PI * sin(PI*p(0))*sin(PI*p(1))*exp(p(2));
-      gradient[2] = sin(PI*p(0))*cos(PI*p(1))*exp(p(2));
-
-      Point<3> normal = p;
-      normal /= p.norm();
-
-      return (- trace(hessian)
-              + 2 * (gradient * normal)
-              + (hessian * normal) * normal);
-   }
-
-
    // @sect3{Implementation of the <code>VTEProblem</code> class}
 
    // The rest of the program is actually quite unspectacular if you know
@@ -287,6 +261,10 @@ namespace VTE
       mapping (degree)
    {
       n_rk_stages = 3;
+      cfl = 0.1;
+      solver_type = DIRECT;
+      
+      cfl = cfl/(2.0*degree+1);
    }
 
 
@@ -336,7 +314,6 @@ namespace VTE
    template <int spacedim>
    void VTEProblem<spacedim>::make_grid_and_dofs ()
    {
-      static SphericalManifold<dim,spacedim> surface_description;
 
       {
          Triangulation<spacedim> volume_mesh;
@@ -349,6 +326,8 @@ namespace VTE
                                                triangulation,
                                                boundary_ids);
       }
+      
+      static SphericalManifold<dim,spacedim> surface_description;
       triangulation.set_all_manifold_ids(0);
       triangulation.set_manifold (0, surface_description);
 
@@ -552,8 +531,8 @@ namespace VTE
 
          for (unsigned int i=0; i<dofs_per_cell; ++i)
             for (unsigned int q_point=0; q_point<n_q_points; ++q_point)
-               cell_rhs(i) += fe_values.shape_value(i,q_point) *
-                              vorticity_values[q_point]*
+               cell_rhs(i) -= vorticity_values[q_point] *
+                              fe_values.shape_value(i,q_point) *
                               fe_values.JxW(q_point);
 
          cell->get_dof_indices (local_dof_indices);
@@ -569,14 +548,34 @@ namespace VTE
    template <int spacedim>
    void VTEProblem<spacedim>::solve_streamfun ()
    {
-      SolverControl solver_control (streamfun.size(),
-                                    1e-8 * system_rhs.l2_norm());
-      SolverCG<>    cg (solver_control);
-
-      cg.solve (system_matrix,
-                streamfun,
-                system_rhs,
-                preconditioner);
+      static bool first_time = true;
+      
+      switch (solver_type)
+      {
+         case DIRECT:
+            static SparseDirectUMFPACK  solver;
+            if(first_time)
+            {
+               solver.initialize (system_matrix);
+               first_time = false;
+            }
+            solver.vmult (streamfun, system_rhs);
+            break;
+            
+         case CG:
+            SolverControl solver_control (streamfun.size(),
+                                          1e-8 * system_rhs.l2_norm());
+            SolverCG<>    cg (solver_control);
+            
+            // make initial guess zero since we repeatedly solve this
+            streamfun = 0;
+            
+            cg.solve (system_matrix,
+                      streamfun,
+                      system_rhs,
+                      preconditioner);
+            break;
+      }
    }
 
 
@@ -611,15 +610,23 @@ namespace VTE
       
       // Face related
       const QGauss<dim-1> quadrature_face (fe_vort.degree + 1);
-      FEFaceValues<dim,spacedim> fe_face_values_vort (fe_vort, quadrature_face,
+      FEFaceValues<dim,spacedim> fe_face_values_vort (mapping,
+                                                      fe_vort,
+                                                      quadrature_face,
                                                       update_values |
                                                       update_quadrature_points |
                                                       update_normal_vectors);
-      FEFaceValues<dim,spacedim> fe_face_values_vort_nbr (fe_vort, quadrature_face,
+      FEFaceValues<dim,spacedim> fe_face_values_vort_nbr (mapping,
+                                                          fe_vort,
+                                                          quadrature_face,
                                                           update_values);
-      FEFaceValues<dim,spacedim> fe_face_values_stream (fe_stream, quadrature_face,
+      FEFaceValues<dim,spacedim> fe_face_values_stream (mapping,
+                                                        fe_stream,
+                                                        quadrature_face,
                                                         update_gradients);
-      FEFaceValues<dim,spacedim> fe_face_values_stream_nbr (fe_stream, quadrature_face,
+      FEFaceValues<dim,spacedim> fe_face_values_stream_nbr (mapping,
+                                                            fe_stream,
+                                                            quadrature_face,
                                                             update_gradients);
       
       const unsigned int n_face_q_points    = quadrature_face.size();
@@ -628,12 +635,15 @@ namespace VTE
       std::vector<double> vorticity_values_face     (n_face_q_points);
       std::vector<double> vorticity_values_face_nbr (n_face_q_points);
 
+      double dt_local = 1.0e20;
+      
       for (typename DoFHandler<dim,spacedim>::active_cell_iterator
            cell = dof_handler_vort.begin_active(),
            endc = dof_handler_vort.end();
            cell!=endc; ++cell)
       {
          const unsigned int cell_no = cell->user_index();
+         double velmax = 0;
 
          cell_rhs = 0;
          
@@ -653,11 +663,15 @@ namespace VTE
             const Point<spacedim> &radial_unit_vector = fe_values_vort.quadrature_point (q_point);
             Tensor<1,spacedim> vel;
             cross_product (vel, radial_unit_vector, stream_gradient_values[q_point]);
+            velmax = std::max(velmax, vel.norm());
             for (unsigned int i=0; i<dofs_per_cell; ++i)
                cell_rhs(i) -= vorticity_values[q_point] *
                               vel * fe_values_vort.shape_grad (i, q_point) *
                               fe_values_vort.JxW(q_point);
          }
+         
+         const double h = cell->diameter();
+         dt_local = std::min (dt_local, h / (velmax + 1.0e-14));
          
          for (unsigned int f=0; f<GeometryInfo<dim>::faces_per_cell; ++f)
             if(cell->neighbor(f)->has_children() == false)
@@ -690,7 +704,8 @@ namespace VTE
                      cross_product (vel, radial_unit_vector, stream_gradient_values_face[q_point]);
                      cross_product (vel_nbr, radial_unit_vector, stream_gradient_values_face_nbr[q_point]);
                      double veln = 0.5 * (vel + vel_nbr) * fe_face_values_vort.normal_vector (q_point);
-                     double flux = (veln > 0) ? veln * vorticity_values_face[q_point] : veln * vorticity_values_face_nbr[q_point];
+                     double flux = (veln > 0) ? veln * vorticity_values_face[q_point]
+                                              : veln * vorticity_values_face_nbr[q_point];
 
                      for (unsigned int i=0; i<dofs_per_cell; ++i)
                      {
@@ -717,12 +732,18 @@ namespace VTE
          for (unsigned int i=0; i<dofs_per_cell; ++i)
             vorticity_rhs(local_dof_indices[i]) += cell_rhs(i) * inv_mass_matrix[cell_no](i);
       }
+      
+      if(dt <= 0.0)
+      {
+         dt = cfl * dt_local;
+      }
    }
 
    // Perform rk'th stage of SSPRK scheme
    template <int spacedim>
    void VTEProblem<spacedim>::update_vte (unsigned int rk)
    {
+      std::cout << "RK stage = " << rk << std::endl;
       for(unsigned int i=0; i<dof_handler_vort.n_dofs(); ++i)
          vorticity(i) = a_rk[rk] * vorticity_old(i) +
                         b_rk[rk] * (vorticity(i) - dt * vorticity_rhs(i));
@@ -757,19 +778,24 @@ namespace VTE
    template <int spacedim>
    void VTEProblem<spacedim>::output_results () const
    {
+      static unsigned int count = 0;
+      
       DataOut<dim,DoFHandler<dim,spacedim> > data_out;
-      data_out.attach_dof_handler (dof_handler_stream);
-      data_out.add_data_vector (streamfun,
-                                "streamfun",
+//      data_out.attach_dof_handler (dof_handler_stream);
+//      data_out.add_data_vector (streamfun,
+//                                "streamfun",
+//                                DataOut<dim,DoFHandler<dim,spacedim> >::type_dof_data);
+      data_out.attach_dof_handler (dof_handler_vort);
+      data_out.add_data_vector (vorticity,
+                                "vorticity",
                                 DataOut<dim,DoFHandler<dim,spacedim> >::type_dof_data);
       data_out.build_patches (mapping,
                               mapping.get_degree());
 
-      std::string filename ("solution-");
-      filename += static_cast<char>('0'+spacedim);
-      filename += "d.vtk";
+      std::string filename = "sol-" + Utilities::int_to_string(count, 4) + ".vtk";
       std::ofstream output (filename.c_str());
       data_out.write_vtk (output);
+      ++count;
    }
 
 
@@ -810,14 +836,16 @@ namespace VTE
       assemble_mass_matrix ();
       assemble_streamfun_matrix ();
       initialize_vorticity ();
-
+      output_results ();
+      
       unsigned int iter = 0;
       double t  = 0;
-      double Tf = 1.0;
+      double Tf = 1.0e6;
       while (t < Tf)
       {
-         // compute time step
-         dt = 0;
+         vorticity_old = vorticity;
+         
+         dt = -1.0; // dt is computed inside assemble_vte_rhs
          
          for(unsigned int rk=0; rk<n_rk_stages; ++rk)
          {
@@ -825,13 +853,14 @@ namespace VTE
             solve_streamfun ();
             assemble_vte_rhs ();
             update_vte (rk);
-            output_results ();
-            compute_error ();
-            return;
          }
          
          t += dt; ++iter;
-         std::cout << "Iter = " << iter << ",  t = " << t << ",  dt = ", dt << std::endl;
+         std::cout << "Iter = " << iter
+                   << ",  t = " << t
+                   << ",  dt = " << dt << std::endl;
+         
+         if(iter%10 == 0) output_results ();
       }
    }
 }
