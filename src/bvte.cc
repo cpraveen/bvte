@@ -669,8 +669,7 @@ namespace VTE
          for (unsigned int q_point=0; q_point<n_q_points; ++q_point)
          {
             const Point<spacedim> &radial_unit_vector = fe_values_vort.quadrature_point (q_point);
-            Tensor<1,spacedim> vel;
-            cross_product (vel, radial_unit_vector, stream_gradient_values[q_point]);
+            Tensor<1,spacedim> vel = cross_product_3d (radial_unit_vector, stream_gradient_values[q_point]);
             velmax = std::max(velmax, vel.norm());
             for (unsigned int i=0; i<dofs_per_cell; ++i)
                cell_rhs(i) -= vorticity_values[q_point] *
@@ -708,9 +707,8 @@ namespace VTE
                   for (unsigned int q_point=0; q_point<n_face_q_points; ++q_point)
                   {
                      const Point<spacedim> &radial_unit_vector = fe_face_values_vort.quadrature_point (q_point);
-                     Tensor<1,spacedim> vel, vel_nbr;
-                     cross_product (vel, radial_unit_vector, stream_gradient_values_face[q_point]);
-                     cross_product (vel_nbr, radial_unit_vector, stream_gradient_values_face_nbr[q_point]);
+                     Tensor<1,spacedim> vel = cross_product_3d (radial_unit_vector, stream_gradient_values_face[q_point]);
+                     Tensor<1,spacedim> vel_nbr = cross_product_3d (radial_unit_vector, stream_gradient_values_face_nbr[q_point]);
                      double veln = 0.5 * (vel + vel_nbr) * fe_face_values_vort.normal_vector (q_point);
                      double flux = (veln > 0) ? veln * vorticity_values_face[q_point]
                                               : veln * vorticity_values_face_nbr[q_point];
