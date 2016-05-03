@@ -155,7 +155,7 @@ namespace VTE
       void assemble_streamfun_matrix ();
       void assemble_streamfun_rhs ();
       void assemble_vte_rhs ();
-      void update_vte (unsigned int rk);
+      void update_vte (const unsigned int rk);
       void solve_streamfun ();
       void output_results (const double elapsed_time) const;
       void compute_error () const;
@@ -389,7 +389,8 @@ namespace VTE
    
    //------------------------------------------------------------------------------
    // Assemble mass matrix for each cell
-   // Invert it and store
+   // Invert it and store. Mass matrix is diagonal, so we store only the diagonal
+   // entries.
    //------------------------------------------------------------------------------
    template <int spacedim>
    void VTEProblem<spacedim>::assemble_mass_matrix ()
@@ -749,7 +750,7 @@ namespace VTE
 
    // Perform rk'th stage of SSPRK scheme
    template <int spacedim>
-   void VTEProblem<spacedim>::update_vte (unsigned int rk)
+   void VTEProblem<spacedim>::update_vte (const unsigned int rk)
    {
       for(unsigned int i=0; i<dof_handler_vort.n_dofs(); ++i)
          vorticity(i) = a_rk[rk] * vorticity_old(i) +
@@ -889,7 +890,8 @@ int main ()
 
       deallog.depth_console (0);
 
-      VTEProblem<3> vte (2);
+      unsigned int degree = 2;
+      VTEProblem<3> vte (degree);
       vte.run();
    }
    catch (std::exception &exc)
