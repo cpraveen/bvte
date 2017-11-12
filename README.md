@@ -4,3 +4,8 @@ DG code to solve barotropic vorticity equation on a sphere
 An example of Rossby-Haurwitz test case is here
 
 https://youtu.be/pU7ItnbNnGI
+
+## TODO
+
+ * Use CubedSphere and MappingManifold
+ * Parallelize with MPI
